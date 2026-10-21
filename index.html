@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0d1020">
+<title>Ding &amp; Buzzer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700&display=swap">
+<style>
+/* Layout: one fixed screen. Top half = two flat side-by-side pads (no text). Bottom half = full screen + screen-on status. */
+:root {
+  --stage: #0d1020;
+  --panel: #161a30;
+  --line: #2a3052;
+  --green: #1fa64a;
+  --green-down: #157a35;
+  --red: #d42b2b;
+  --red-down: #9c1c1c;
+  --ink: #f2f3f8;
+  --muted: #9097b8;
+  --ok: #4cd38a;
+  --body: "Archivo", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark;
+}
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--stage);
+  color: var(--ink);
+  font-family: var(--body);
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.app {
+  height: 100%;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  gap: 14px;
+  padding-top: max(14px, env(safe-area-inset-top, 0px));
+  padding-bottom: max(14px, env(safe-area-inset-bottom, 0px));
+  padding-left: max(14px, env(safe-area-inset-left, 0px));
+  padding-right: max(14px, env(safe-area-inset-right, 0px));
+}
+.pads { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; min-height: 0; }
+.pad {
+  border: 0;
+  border-radius: 18px;
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+  min-height: 0;
+  touch-action: manipulation;
+}
+.pad--ding { background: var(--green); }
+.pad--buzz { background: var(--red); }
+.pad--ding.is-down { background: var(--green-down); }
+.pad--buzz.is-down { background: var(--red-down); }
+.pad:focus-visible { outline: 4px solid var(--ink); outline-offset: 3px; }
+
+.controls {
+  min-height: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 18px;
+}
+.fs {
+  font: 700 16px/1 var(--body);
+  color: var(--ink);
+  background: var(--panel);
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  padding: 16px 26px;
+  cursor: pointer;
+}
+.fs:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+.status { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+.status[data-state="on"] { color: var(--ink); }
+.status[data-state="on"] .dot { background: var(--ok); }
+.status[data-state="off"] .dot { background: var(--red); }
+</style>
+</head>
+<body>
+<main class="app">
+  <section class="pads" aria-label="Sound pads">
+    <button class="pad pad--ding" id="pad-ding" type="button" aria-label="Play correct sound"></button>
+    <button class="pad pad--buzz" id="pad-buzz" type="button" aria-label="Play wrong sound"></button>
+  </section>
+
+  <section class="controls" aria-label="Controls">
+    <button class="fs" id="fs-btn" type="button">Go full screen</button>
+    <div class="status" id="wake" data-state="idle" role="status">
+      <span class="dot"></span><span id="wake-text">Tap a pad to keep screen on</span>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* =====================================================================
+     CORRECT SOUND: "Grand ding"
+     Additive bell (summed sine partials, each with its own exponential decay),
+     mallet noise tick, low-cut, saturation, small-room Schroeder reverb.
+     Rendered once, sample by sample, then played as a buffer.
+     ===================================================================== */
+  var DING_SR = 44100;          // sample rate, Hz
+  var DING_F0 = 1175;           // fundamental, Hz
+  var DING_RING = 0.42;         // decay tau of main tone + shimmer copy, s
+  var DING_BODY = 0.52;         // level of the tone one octave below
+  var DING_SAT = 2.0;           // saturation drive: y = tanh(k x) / tanh(k)
+  var DING_RT60 = 0.55;         // reverb decay to -60 dB, s
+  var DING_WET = 0.18;          // reverb wet share (dry = 1 - wet)
+  var DING_PREDELAY = 0.012;    // reverb pre-delay, s
+  // [frequency ratio to f0, amplitude, decay tau s]; envelope = amp * exp(-t / tau)
+  var DING_PARTIALS = [
+    [0.50,   DING_BODY, DING_RING * 1.1],  // body: one octave down
+    [1.00,   1.00, DING_RING],             // main tone
+    [1.0025, 0.50, DING_RING],             // detuned copy: slow beating = shimmer
+    [2.00,   0.35, DING_RING * 0.7],       // octave: brightness
+    [2.76,   0.20, 0.12],                  // inharmonic: metallic bell quality
+    [4.10,   0.10, 0.08],                  // upper sparkle
+    [5.40,   0.06, 0.05]                   // upper sparkle, fades fastest
+  ];
+  var DING_DUR = 0.2 + DING_RING * 5 + DING_RT60;  // total length incl. reverb tail, s
+  var DING_ATTACK = 0.002;      // linear rise of the summed partials, s
+  var DING_NOISE_LEN = 0.004;   // mallet tick: white-noise burst length, s
+  var DING_NOISE_HP = 3000;     // mallet tick high-pass, Hz
+  var DING_NOISE_ATTACK = 0.0005;
+  var DING_NOISE_TAU = 0.0015;
+  var DING_NOISE_MIX = 0.15;    // relative to the main tone
+  var DING_LOWCUT = 300;        // low-cut, Hz
+  var DING_PEAK_DB = -1;        // peak normalization, dBFS
+  var DING_FADE_OUT = 0.010;    // linear fade at the very end, s
+
+  // 2nd-order Butterworth high-pass (bilinear-transform biquad, Q = 1/sqrt 2).
+  function highpass(x, sr, fc) {
+    var w0 = 2 * Math.PI * fc / sr, cs = Math.cos(w0), al = Math.sin(w0) / Math.SQRT2, a0 = 1 + al;
+    var b0 = (1 + cs) / 2 / a0, b1 = -(1 + cs) / a0, b2 = b0, a1 = -2 * cs / a0, a2 = (1 - al) / a0;
+    var y = new Float32Array(x.length), x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (var i = 0; i < x.length; i++) {
+      var v = b0 * x[i] + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1; x1 = x[i]; y2 = y1; y1 = v; y[i] = v;
+    }
+    return y;
+  }
+
+  function peakOf(x) { var p = 0; for (var i = 0; i < x.length; i++) p = Math.max(p, Math.abs(x[i])); return p; }
+  function scaleTo(x, target) { var k = target / (peakOf(x) || 1); for (var i = 0; i < x.length; i++) x[i] *= k; return x; }
+
+  // Schroeder reverb: pre-delay -> 4 parallel feedback combs -> 2 series all-passes.
+  function schroeder(x, sr, rt60, predelay) {
+    var n = x.length, pd = Math.round(predelay * sr), i;
+    var inp = new Float32Array(n);
+    for (i = pd; i < n; i++) inp[i] = x[i - pd];
+    var out = new Float32Array(n);
+    [0.0297, 0.0371, 0.0411, 0.0437].forEach(function (d) {
+      var D = Math.round(d * sr), g = Math.pow(10, -3 * d / rt60), buf = new Float32Array(n);
+      for (var j = 0; j < n; j++) {
+        buf[j] = inp[j] + (j >= D ? g * buf[j - D] : 0);
+        out[j] += buf[j] / 4;
+      }
+    });
+    [[0.005, 0.7], [0.0017, 0.7]].forEach(function (p) {
+      var D = Math.round(p[0] * sr), g = p[1], y = new Float32Array(n);
+      for (var j = 0; j < n; j++) y[j] = -g * out[j] + (j >= D ? out[j - D] + g * y[j - D] : 0);
+      out = y;
+    });
+    return out;
+  }
+
+  function renderDing() {
+    var sr = DING_SR, n = Math.round(DING_DUR * sr), i;
+    var x = new Float32Array(n);
+    DING_PARTIALS.forEach(function (p) {
+      var w = 2 * Math.PI * DING_F0 * p[0] / sr, ph = Math.random() * 2 * Math.PI;
+      for (var j = 0; j < n; j++) x[j] += p[1] * Math.exp(-(j / sr) / p[2]) * Math.sin(w * j + ph);
+    });
+    var na = Math.round(DING_ATTACK * sr);
+    for (i = 0; i < na; i++) x[i] *= i / na;
+    var nn = Math.round(DING_NOISE_LEN * sr), noise = new Float32Array(n);
+    for (i = 0; i < nn; i++) noise[i] = Math.random() * 2 - 1;
+    noise = highpass(noise, sr, DING_NOISE_HP);
+    for (i = 0; i < n; i++) {
+      var t = i / sr;
+      noise[i] *= t < DING_NOISE_ATTACK ? t / DING_NOISE_ATTACK : Math.exp(-(t - DING_NOISE_ATTACK) / DING_NOISE_TAU);
+    }
+    scaleTo(noise, DING_NOISE_MIX);
+    for (i = 0; i < n; i++) x[i] += noise[i];
+    x = highpass(x, sr, DING_LOWCUT);
+    scaleTo(x, 1);
+    var norm = Math.tanh(DING_SAT);
+    for (i = 0; i < n; i++) x[i] = Math.tanh(DING_SAT * x[i]) / norm;
+    var wet = scaleTo(schroeder(x, sr, DING_RT60, DING_PREDELAY), peakOf(x));
+    for (i = 0; i < n; i++) x[i] = (1 - DING_WET) * x[i] + DING_WET * wet[i];
+    scaleTo(x, Math.pow(10, DING_PEAK_DB / 20));
+    var nf = Math.round(DING_FADE_OUT * sr);
+    for (i = 0; i < nf; i++) x[n - 1 - i] *= i / nf;
+    return x;
+  }
+
+  var dingData = renderDing();
+  var dingBuffer = null;
+
+  /* =====================================================================
+     WRONG SOUND: "Nasal" buzzer
+     130 Hz saw + square -> light distortion -> "AAANK" vowel formants
+     + 250 Hz nasal resonance and a notch near 1050 Hz. Instant start,
+     steady 0.9 s hold, abrupt 8 ms stop.
+     ===================================================================== */
+  var BUZZ_F0 = 130;            // pitch, Hz
+  var BUZZ_DUR = 0.9;           // length, s
+  var BUZZ_DRIVE = 12;          // distortion amount
+  var BUZZ_CUTOFF = 5000;       // top-end lowpass, Hz
+  // [center Hz, Q (narrowness), level]
+  var BUZZ_FORMANTS = [[750, 4, 2.2], [1800, 6, 1.6], [2700, 8, .6], [250, 3, 1.4]];
+  var BUZZ_NOTCH = 1050;        // nasal notch, Hz
+
+  /* ---------- Audio engine ---------- */
+  var ctx = null, master = null;
+  var playing = { ding: null, buzz: null };
+
+  function audio() {
+    if (!ctx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC({ latencyHint: "interactive" });
+      master = ctx.createGain();
+      master.gain.value = 1.0;
+      var comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -8;
+      comp.ratio.value = 4;
+      master.connect(comp);
+      comp.connect(ctx.destination);
+    }
+    if (ctx.state === "suspended") ctx.resume();
+    return ctx;
+  }
+
+  function stopSound(ch) {
+    var p = playing[ch];
+    if (!p) return;
+    var t = ctx.currentTime;
+    p.out.gain.cancelScheduledValues(t);
+    p.out.gain.setValueAtTime(p.out.gain.value, t);
+    p.out.gain.linearRampToValueAtTime(0, t + 0.015);
+    p.srcs.forEach(function (s) { try { s.stop(t + 0.03); } catch (e) {} });
+    playing[ch] = null;
+  }
+
+  function oscAt(c, type, f, dest, t, end, amp) {
+    var o = c.createOscillator();
+    o.type = type;
+    o.frequency.value = f;
+    var g = c.createGain();
+    g.gain.value = amp;
+    o.connect(g);
+    g.connect(dest);
+    o.start(t);
+    o.stop(end);
+    return o;
+  }
+
+  function shaperCurve(k) {
+    var n = 1024, curve = new Float32Array(n);
+    for (var i = 0; i < n; i++) {
+      var x = (i * 2) / n - 1;
+      curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
+    }
+    return curve;
+  }
+
+  // Ding goes straight to the speaker (already normalized; skips the buzzer's compressor).
+  function startDing(c, t, srcs) {
+    if (!dingBuffer) {
+      dingBuffer = c.createBuffer(1, dingData.length, DING_SR);
+      dingBuffer.getChannelData(0).set(dingData);
+    }
+    var out = c.createGain();
+    out.gain.value = 1;
+    out.connect(c.destination);
+    var src = c.createBufferSource();
+    src.buffer = dingBuffer;
+    src.connect(out);
+    src.start(t);
+    srcs.push(src);
+    return { out: out, len: DING_DUR };
+  }
+
+  function startBuzz(c, t, srcs) {
+    var out = c.createGain();
+    out.gain.setValueAtTime(0, t);
+    out.gain.linearRampToValueAtTime(.6, t + 0.004);
+    out.gain.setValueAtTime(.6, t + BUZZ_DUR - 0.008);
+    out.gain.linearRampToValueAtTime(0, t + BUZZ_DUR);
+    out.connect(master);
+    var sum = c.createGain();
+    var shaper = c.createWaveShaper();
+    shaper.curve = shaperCurve(BUZZ_DRIVE);
+    shaper.oversample = "2x";
+    sum.connect(shaper);
+    var mix = c.createGain();
+    var notch = c.createBiquadFilter();
+    notch.type = "notch";
+    notch.frequency.value = BUZZ_NOTCH;
+    notch.Q.value = 2;
+    var lp = c.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = BUZZ_CUTOFF;
+    mix.connect(notch);
+    notch.connect(lp);
+    lp.connect(out);
+    var dry = c.createGain();
+    dry.gain.value = .3;
+    shaper.connect(dry);
+    dry.connect(mix);
+    BUZZ_FORMANTS.forEach(function (fm) {
+      var bp = c.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.value = fm[0];
+      bp.Q.value = fm[1];
+      var g = c.createGain();
+      g.gain.value = fm[2];
+      shaper.connect(bp);
+      bp.connect(g);
+      g.connect(mix);
+    });
+    var end = t + BUZZ_DUR + 0.02;
+    srcs.push(oscAt(c, "sawtooth", BUZZ_F0, sum, t, end, .5));
+    srcs.push(oscAt(c, "square", BUZZ_F0, sum, t, end, .35));
+    return { out: out, len: BUZZ_DUR };
+  }
+
+  // Re-pressing a pad restarts its sound.
+  function play(ch) {
+    var c = audio();
+    stopSound(ch);
+    var t = c.currentTime + 0.005;
+    var srcs = [];
+    var r = (ch === "ding" ? startDing : startBuzz)(c, t, srcs);
+    var entry = { out: r.out, srcs: srcs };
+    playing[ch] = entry;
+    setTimeout(function () { if (playing[ch] === entry) playing[ch] = null; }, r.len * 1000 + 100);
+  }
+
+  /* ---------- Keep screen awake ---------- */
+  var lock = null;
+  var wakeEl = document.getElementById("wake");
+  var wakeText = document.getElementById("wake-text");
+
+  function setWake(state, text) {
+    wakeEl.setAttribute("data-state", state);
+    wakeText.textContent = text;
+  }
+
+  function keepAwake() {
+    if (!("wakeLock" in navigator)) {
+      setWake("off", "Can't keep screen on");
+      return;
+    }
+    if (lock && !lock.released) return;
+    if (document.visibilityState !== "visible") return;
+    navigator.wakeLock.request("screen").then(function (l) {
+      lock = l;
+      setWake("on", "Screen stays on");
+      l.addEventListener("release", function () { setWake("off", "Screen can sleep"); });
+    }).catch(function () {
+      setWake("off", "Screen can sleep");
+    });
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") keepAwake();
+  });
+  keepAwake();
+
+  /* ---------- Pads ---------- */
+  function wire(id, ch) {
+    var el = document.getElementById(id);
+    function press() {
+      play(ch);
+      keepAwake();
+      el.classList.add("is-down");
+      clearTimeout(el._t);
+      el._t = setTimeout(function () { el.classList.remove("is-down"); }, 130);
+    }
+    el.addEventListener("pointerdown", function (e) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      press();
+    });
+    el.addEventListener("click", function (e) { if (e.detail === 0) press(); });
+  }
+  wire("pad-ding", "ding");
+  wire("pad-buzz", "buzz");
+
+  /* ---------- Full screen ---------- */
+  var fsBtn = document.getElementById("fs-btn");
+  var root = document.documentElement;
+  var canFs = !!(root.requestFullscreen || root.webkitRequestFullscreen);
+  function isFs() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+  function syncFs() { fsBtn.textContent = isFs() ? "Exit full screen" : "Go full screen"; }
+
+  if (!canFs) {
+    fsBtn.hidden = true;
+  } else {
+    fsBtn.addEventListener("click", function () {
+      audio();
+      keepAwake();
+      if (isFs()) {
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+        return;
+      }
+      var req = (root.requestFullscreen || root.webkitRequestFullscreen).call(root, { navigationUI: "hide" });
+      if (req && req.then) {
+        req.then(function () {
+          if (screen.orientation && screen.orientation.lock) {
+            screen.orientation.lock("portrait").catch(function () {});
+          }
+        }).catch(function () { fsBtn.textContent = "Blocked. Tap again"; });
+      }
+    });
+    document.addEventListener("fullscreenchange", function () { syncFs(); keepAwake(); });
+    document.addEventListener("webkitfullscreenchange", syncFs);
+  }
+
+  document.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+})();
+</script>
+</body>
+</html>
